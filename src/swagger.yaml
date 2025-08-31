@@ -1,0 +1,57 @@
+openapi: 3.0.0
+info:
+  title: Voice Training API
+  version: 1.0.0
+
+servers:
+  - url: http://localhost:5000/api
+
+paths:
+  /auth/register:
+    post:
+      summary: Register a new user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                email: { type: string }
+                password: { type: string }
+                role: { type: string }
+      responses:
+        "200":
+          description: User registered
+  /auth/login:
+    post:
+      summary: Login user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                email: { type: string }
+                password: { type: string }
+      responses:
+        "200":
+          description: JWT token returned
+  /sessions:
+    get:
+      summary: Get all sessions
+      responses:
+        "200":
+          description: List of sessions
+  /sessions/export:
+    get:
+      summary: Export sessions as CSV
+      responses:
+        "200":
+          description: CSV file
+          content:
+            text/csv:
+              schema:
+                type: string
