@@ -1,75 +1,149 @@
+// backend/src/server.ts
 import "dotenv/config";
-import { Pool } from "pg";
 import http from "http";
+import jwt from "jsonwebtoken";
 import { Server } from "socket.io";
 import app from "./app";
+import { pool } from "./db";
 import { pub, sub } from "./redis";
-
-export const pool = new Pool({
-  user: process.env.DB_USER,
-  host: process.env.DB_HOST,
-  database: process.env.DB_NAME,
-  password: process.env.DB_PASS,
-  port: Number(process.env.DB_PORT),
-});
+import { connectMongo } from "./mongo";
 
 const PORT = process.env.PORT || 5000;
+const JWT_SECRET = process.env.JWT_SECRET || "secret123";
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
+// socket auth (same as you had)
+io.use((socket, next) => {
+  try {
+    const token =
+      socket.handshake.auth?.token ||
+      (socket.handshake.headers?.authorization || "").split(" ")[1];
+    if (!token) return next(new Error("Auth error"));
+    const decoded: any = jwt.verify(token, JWT_SECRET);
+    socket.data.user = { id: decoded.id, role: decoded.role, email: decoded.email };
+    return next();
+  } catch (err) {
+    return next(new Error("Auth error"));
+  }
+});
+
 io.on("connection", (socket: any) => {
-  console.log("Client connected");
+  console.log("Client connected", socket.id, "user:", socket.data.user);
+
+  socket.on("start-session", async () => {
+    // create Postgres session and attach sessionId
+    const userId = socket.data.user?.id || null;
+    try {
+      const r = await pool.query(
+        `INSERT INTO sessions (user_id, started_at) VALUES ($1, now()) RETURNING id, started_at`,
+        [userId]
+      );
+      socket.data.sessionId = r.rows[0].id;
+      socket.emit("session-started", { sessionId: socket.data.sessionId });
+    } catch (err) {
+      console.error("Failed to create session", err);
+      socket.emit("error", { message: "Failed to create session" });
+    }
+  });
+
+  
 
   socket.on("audio-chunk", async (chunk: Buffer) => {
-    console.log("🎤 Received audio chunk", chunk.length);
+    // process STT -> text (dummy here)
+    const text = "dummy transcript from audio chunk";
+    const sessionId = socket.data.sessionId || null;
+    const userId = socket.data.user?.id || null;
+    const seq = (socket.data.seq = (socket.data.seq || 0) + 1);
+    const doc = {
+      sessionId,
+      userId,
+      text,
+      seq,
+      createdAt: new Date()
+    };
 
-    const transcript = { text: " [dummy transcript- audio ]", trainee: socket.id };
+    // save to Mongo
+    try {
+      const db = await connectMongo();
+      await db.collection("transcripts").insertOne(doc);
+      // optional: set TTL later if desired
+    } catch (err) {
+      console.error("Mongo insert transcript failed", err);
+    }
 
-    await pub.publish("transcripts", JSON.stringify(transcript));
+    // publish to Redis channel so other servers can broadcast
+    try {
+      await pub.publish("transcripts", JSON.stringify(doc));
+    } catch (err) {
+      console.error("Redis publish error", err);
+    }
+
+    // emit ack or transcript back to client
+    socket.emit("transcript", doc);
   });
 
   socket.on("end-audio", async () => {
-    console.log("Session ended");
-
+    const sessionId = socket.data.sessionId || null;
+    const userId = socket.data.user?.id || null;
     const feedback = {
       fluency: Math.floor(Math.random() * 21) + 70,
       clarity: Math.floor(Math.random() * 21) + 70,
-      grammar: Math.floor(Math.random() * 21) + 70,
+      grammar: Math.floor(Math.random() * 21) + 70
     };
 
+    // update Postgres session
     try {
       await pool.query(
-        "INSERT INTO sessions (trainee, fluency, clarity, grammar) VALUES ($1, $2, $3, $4)",
-        [socket.id, feedback.fluency, feedback.clarity, feedback.grammar]
+        `UPDATE sessions SET ended_at=now(), fluency=$1, clarity=$2, grammar=$3 WHERE id=$4`,
+        [feedback.fluency, feedback.clarity, feedback.grammar, sessionId]
       );
-      console.log("Session saved ✅");
     } catch (err) {
-      console.error("DB insert error:", err);
+      console.error("Postgres update session failed", err);
+    }
+
+    // save feedback log to Mongo
+    try {
+      const db = await connectMongo();
+      await db.collection("logs").insertOne({
+        sessionId,
+        userId,
+        event: "feedback",
+        feedback,
+        createdAt: new Date()
+      });
+    } catch (err) {
+      console.error("Mongo insert log failed", err);
+    }
+
+    // publish feedback
+    try {
+      await pub.publish("feedback", JSON.stringify({ sessionId, userId, feedback }));
+    } catch (err) {
+      console.error("Redis publish feedback error", err);
     }
 
     socket.emit("feedback", feedback);
   });
 
-  socket.on("disconnect", () => console.log("Client disconnected"));
+  socket.on("disconnect", () => {
+    console.log("Client disconnected", socket.id);
+  });
 });
 
-sub.subscribe("transcripts", (err, count) => {
-  if (err) {
-    console.error(" Redis subscribe error:", err);
-  } else {
-    console.log(` Subscribed to transcripts channel (${count})`);
-  }
-});
-
+// Redis subscriber to broadcast incoming messages
+sub.subscribe("transcripts", "feedback");
 sub.on("message", (channel, message) => {
-  if (channel === "transcripts") {
+  try {
     const data = JSON.parse(message);
-    console.log(" Received transcript via Redis:", data);
-    io.emit("transcript", data);
+    if (channel === "transcripts") io.emit("transcript", data);
+    if (channel === "feedback") io.emit("feedback", data);
+  } catch (err) {
+    console.error("Error parsing redis message", err);
   }
 });
-server.listen(PORT, () => {
-  console.log(`Backend running on http://localhost:${PORT}`);
-});
+
+server.listen(PORT, () => console.log(`Listening ${PORT}`));
+export { pool };
 

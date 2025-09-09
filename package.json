@@ -20,6 +20,7 @@
     "ioredis": "^5.7.0",
     "json2csv": "^6.0.0-alpha.2",
     "jsonwebtoken": "^9.0.2",
+    "mongodb": "^6.19.0",
     "pg": "^8.16.3",
     "redis": "^4.6.13",
     "socket.io": "^4.8.1",
